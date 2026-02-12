@@ -10,14 +10,15 @@ import numpy as np
 
 def load_hidden_states(
     hidden_states_dir: str,
-    model_short_name: str,
+    model_short_name: Optional[str] = None,
     problem_ids: Optional[list[str]] = None,
 ) -> dict[int, tuple[np.ndarray, np.ndarray]]:
     """Load hidden states from npz files and aggregate by layer.
 
     Args:
-        hidden_states_dir: Directory containing npz files.
-        model_short_name: Model short name used in filename prefix.
+        hidden_states_dir: Directory containing npz files (e.g. data/hidden_states/distilled/).
+        model_short_name: Deprecated. Kept for backwards compatibility but ignored.
+            The directory should already point to the model-specific subdirectory.
         problem_ids: If provided, only load these problem IDs.
 
     Returns:
@@ -27,10 +28,10 @@ def load_hidden_states(
     layer_labels: dict[int, list[np.ndarray]] = {}
 
     directory = Path(hidden_states_dir)
-    pattern = f"{model_short_name}_problem_*.npz"
+    pattern = "problem_*.npz"
 
     for npz_path in sorted(directory.glob(pattern)):
-        pid = npz_path.stem.split("_problem_")[1]
+        pid = npz_path.stem.split("problem_")[1]
         if problem_ids is not None and pid not in problem_ids:
             continue
 
