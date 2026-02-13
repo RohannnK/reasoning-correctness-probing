@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
-from sklearn.model_selection import GridSearchCV, StratifiedShuffleSplit, train_test_split
+from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, StratifiedShuffleSplit
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils.class_weight import compute_sample_weight
@@ -37,7 +37,7 @@ RANDOM_STATE = 42
 
 def _load_layer_data(
     model_dir: str, problems: list[dict],
-) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """Load hidden states with per-sample position metadata.
 
     Args:
@@ -45,12 +45,13 @@ def _load_layer_data(
         problems: Loaded chunks JSONL records.
 
     Returns:
-        Dict mapping layer_idx to (X, y, positions, is_last) arrays.
+        Dict mapping layer_idx to (X, y, positions, is_last, problem_ids) arrays.
     """
     layer_vecs: dict[int, list[np.ndarray]] = {}
     layer_labels: dict[int, list[int]] = {}
     layer_positions: dict[int, list[float]] = {}
     layer_is_last: dict[int, list[bool]] = {}
+    layer_problem_ids: dict[int, list[int]] = {}
 
     for problem in problems:
         pid = problem["problem_id"]
@@ -71,6 +72,7 @@ def _load_layer_data(
                 layer_labels[layer_idx] = []
                 layer_positions[layer_idx] = []
                 layer_is_last[layer_idx] = []
+                layer_problem_ids[layer_idx] = []
 
             vecs = data[key]  # (num_chunks, hidden_dim)
             for i in range(num_chunks):
@@ -78,6 +80,7 @@ def _load_layer_data(
                 layer_labels[layer_idx].append(int(labels[i]))
                 layer_positions[layer_idx].append(i / max(num_chunks - 1, 1))
                 layer_is_last[layer_idx].append(i == num_chunks - 1)
+                layer_problem_ids[layer_idx].append(pid)
 
     result = {}
     for layer_idx in sorted(layer_vecs.keys()):
@@ -86,16 +89,41 @@ def _load_layer_data(
             np.array(layer_labels[layer_idx]),
             np.array(layer_positions[layer_idx]),
             np.array(layer_is_last[layer_idx]),
+            np.array(layer_problem_ids[layer_idx]),
         )
     return result
 
 
+def _bootstrap_roc_auc(
+    y_true: np.ndarray, y_prob: np.ndarray, n_boot: int = 1000, seed: int = 42,
+) -> tuple[float, float]:
+    """Compute bootstrap 95% CI for ROC-AUC.
+
+    Returns (ci_lo, ci_hi) as 2.5th and 97.5th percentiles.
+    """
+    rng = np.random.RandomState(seed)
+    n = len(y_true)
+    aucs = []
+    for _ in range(n_boot):
+        idx = rng.randint(0, n, size=n)
+        y_t, y_p = y_true[idx], y_prob[idx]
+        if len(np.unique(y_t)) < 2:
+            continue
+        aucs.append(roc_auc_score(y_t, y_p))
+    if not aucs:
+        return (np.nan, np.nan)
+    return (float(np.percentile(aucs, 2.5)), float(np.percentile(aucs, 97.5)))
+
+
 def _eval_probe(probe, X_test, y_test):
-    """Evaluate a fitted probe, returning metrics dict."""
+    """Evaluate a fitted probe, returning metrics dict with bootstrap CIs."""
     probs = probe.predict_proba(X_test)[:, 1]
     preds = probe.predict(X_test)
+    ci_lo, ci_hi = _bootstrap_roc_auc(y_test, probs)
     return {
         "roc_auc": roc_auc_score(y_test, probs),
+        "roc_auc_ci_lo": ci_lo,
+        "roc_auc_ci_hi": ci_hi,
         "precision": precision_score(y_test, preds, zero_division=0),
         "recall": recall_score(y_test, preds, zero_division=0),
         "f1": f1_score(y_test, preds, zero_division=0),
@@ -176,7 +204,11 @@ def train_probes(
 
         print(f"Loaded {len(layer_data)} layers")
 
-        for layer_idx, (X, y, positions, is_last) in sorted(layer_data.items()):
+        gss = GroupShuffleSplit(
+            n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE,
+        )
+
+        for layer_idx, (X, y, positions, is_last, problem_ids) in sorted(layer_data.items()):
             print(f"\n[{model_key}] Layer {layer_idx}: {X.shape[0]} samples, "
                   f"positive rate: {y.mean():.3f}")
 
@@ -184,12 +216,15 @@ def train_probes(
                 print(f"  Skipping: only one class present.")
                 continue
 
+            # Problem-level train/test split (used for all_chunks and position baseline)
+            train_idx, test_idx = next(gss.split(X, y, groups=problem_ids))
+
             # ---- Position-only baseline (fit once, duplicate for both models) ----
             if not position_baseline_done:
-                pos_train, pos_test, yp_train, yp_test = train_test_split(
-                    positions.reshape(-1, 1), y,
-                    test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y,
-                )
+                pos_train = positions[train_idx].reshape(-1, 1)
+                pos_test = positions[test_idx].reshape(-1, 1)
+                yp_train, yp_test = y[train_idx], y[test_idx]
+
                 pos_lr = LogisticRegression(
                     class_weight="balanced", max_iter=1000, solver="lbfgs",
                 )
@@ -210,9 +245,8 @@ def train_probes(
                 position_baseline_done = True
 
             # ---- All-chunks probes (position confounded) ----
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y,
-            )
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
 
             lr_metrics, best_c = _train_linear(X_train, y_train, X_test, y_test)
             results.append({
@@ -234,15 +268,20 @@ def train_probes(
             # ---- Last-chunk-only probes (position controlled) ----
             mask = is_last
             X_last, y_last = X[mask], y[mask]
+            pids_last = problem_ids[mask]
 
             if len(np.unique(y_last)) < 2:
                 print(f"  Last-chunk-only: only one class, skipping.")
                 continue
 
-            X_train_l, X_test_l, y_train_l, y_test_l = train_test_split(
-                X_last, y_last,
-                test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y_last,
+            gss_last = GroupShuffleSplit(
+                n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE,
             )
+            train_idx_l, test_idx_l = next(
+                gss_last.split(X_last, y_last, groups=pids_last),
+            )
+            X_train_l, X_test_l = X_last[train_idx_l], X_last[test_idx_l]
+            y_train_l, y_test_l = y_last[train_idx_l], y_last[test_idx_l]
 
             lr_last_metrics, best_c_last = _train_linear(
                 X_train_l, y_train_l, X_test_l, y_test_l,
@@ -314,9 +353,13 @@ def _plot_layer_roc_auc(df: pd.DataFrame, output_dir: str) -> None:
             if subset.empty:
                 continue
 
-            ax.plot(
+            yerr_lo = subset["roc_auc"] - subset["roc_auc_ci_lo"]
+            yerr_hi = subset["roc_auc_ci_hi"] - subset["roc_auc"]
+            ax.errorbar(
                 subset["layer"], subset["roc_auc"],
-                marker="o", markersize=3, label=MODEL_LABELS[model_key],
+                yerr=[yerr_lo.values, yerr_hi.values],
+                marker="o", markersize=3, capsize=2,
+                label=MODEL_LABELS[model_key],
             )
 
         if pos_auc is not None:
@@ -363,8 +406,11 @@ def _print_summary(df: pd.DataFrame) -> None:
                 if subset.empty:
                     continue
                 best = subset.loc[subset["roc_auc"].idxmax()]
+                ci_lo = best.get("roc_auc_ci_lo", float("nan"))
+                ci_hi = best.get("roc_auc_ci_hi", float("nan"))
                 print(f"  {model_key:>10} / {probe_type:<6}  →  "
-                      f"layer {int(best['layer']):2d}  ROC-AUC={best['roc_auc']:.4f}")
+                      f"layer {int(best['layer']):2d}  "
+                      f"ROC-AUC={best['roc_auc']:.4f} [{ci_lo:.2f}, {ci_hi:.2f}]")
 
 
 def main() -> None:
