@@ -23,6 +23,7 @@ DEFAULT_PROBE_RESULTS_PATH = "results/metrics/probe_results.csv"
 DEFAULT_OUTPUT_DIR = "results"
 
 C_VALUES = [0.001, 0.01, 0.1, 1.0, 10.0]
+FIXED_C = 0.1
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 TOP_K = 20
@@ -199,6 +200,55 @@ def _core_sparsity(layer_data: dict, output_dir: str) -> pd.DataFrame:
     return df
 
 
+def _fixed_c_sparsity(layer_data: dict, output_dir: str) -> pd.DataFrame:
+    """Run L1 probes at fixed C=0.1 across all layers for smooth sparsity curves."""
+    metrics_dir = os.path.join(output_dir, "metrics")
+    os.makedirs(metrics_dir, exist_ok=True)
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    results = []
+
+    for layer_idx in sorted(layer_data.keys()):
+        X_base, X_dist, labels, is_last, pids = layer_data[layer_idx]
+
+        mask = is_last
+        y = labels[mask]
+        g = pids[mask]
+
+        if len(np.unique(y)) < 2:
+            print(f"  Layer {layer_idx}: skipping (single class)")
+            continue
+
+        train_idx, test_idx = next(gss.split(y, y, groups=g))
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        for model_key, X_all in [("base", X_base), ("distilled", X_dist)]:
+            X = X_all[mask]
+            X_train, X_test = X[train_idx], X[test_idx]
+
+            auc, num_nonzero, _ = _train_l1_probe(
+                X_train, y_train, X_test, y_test, FIXED_C,
+            )
+            results.append({
+                "model": model_key,
+                "layer": layer_idx,
+                "C": FIXED_C,
+                "roc_auc": auc,
+                "num_nonzero": num_nonzero,
+                "sparsity_ratio": num_nonzero / 1536,
+            })
+
+        print(f"  Layer {layer_idx:2d}: "
+              f"base={results[-2]['num_nonzero']:3d} dims (AUC={results[-2]['roc_auc']:.4f})  "
+              f"dist={results[-1]['num_nonzero']:3d} dims (AUC={results[-1]['roc_auc']:.4f})")
+
+    df = pd.DataFrame(results)
+    csv_path = os.path.join(metrics_dir, "sparsity_results_fixed_c.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Saved fixed-C sparsity results to {csv_path}")
+    return df
+
+
 def _sparsity_tradeoff(
     layer_data: dict, best_layer: int, output_dir: str,
 ) -> pd.DataFrame:
@@ -251,25 +301,14 @@ def _dimension_overlap(
     train_idx, test_idx = next(gss.split(y, y, groups=g))
     y_train, y_test = y[train_idx], y[test_idx]
 
-    # Train at best C for each model (find best C first)
+    # Train at fixed C=0.1 for meaningful sparsity comparison
     model_coefs = {}
-    model_best_c = {}
     for model_key, X_all in [("base", X_base), ("distilled", X_dist)]:
         X = X_all[mask]
         X_train, X_test = X[train_idx], X[test_idx]
 
-        best_auc = -1
-        best_coefs = None
-        best_c = None
-        for C in C_VALUES:
-            auc, _, coefs = _train_l1_probe(X_train, y_train, X_test, y_test, C)
-            if auc > best_auc:
-                best_auc = auc
-                best_coefs = coefs
-                best_c = C
-
-        model_coefs[model_key] = best_coefs
-        model_best_c[model_key] = best_c
+        _, _, coefs = _train_l1_probe(X_train, y_train, X_test, y_test, FIXED_C)
+        model_coefs[model_key] = coefs
 
     base_nonzero = set(np.nonzero(model_coefs["base"])[0].tolist())
     dist_nonzero = set(np.nonzero(model_coefs["distilled"])[0].tolist())
@@ -289,8 +328,7 @@ def _dimension_overlap(
 
     overlap_info = {
         "best_layer": best_layer,
-        "base_best_C": model_best_c["base"],
-        "distilled_best_C": model_best_c["distilled"],
+        "C": FIXED_C,
         "base_nonzero_count": len(base_nonzero),
         "distilled_nonzero_count": len(dist_nonzero),
         "shared_count": len(shared),
@@ -307,23 +345,34 @@ def _dimension_overlap(
     return overlap_info
 
 
-def _plot_sparsity_by_layer(results_df: pd.DataFrame, output_dir: str) -> None:
-    """Plot nonzero dimensions vs layer for both models."""
+def _plot_sparsity_by_layer(fixed_c_df: pd.DataFrame, output_dir: str) -> None:
+    """Plot nonzero dimensions and ROC-AUC at fixed C across layers."""
     figures_dir = os.path.join(output_dir, "figures")
     os.makedirs(figures_dir, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
     for model_key in MODEL_KEYS:
-        subset = results_df[results_df["model"] == model_key].sort_values("layer")
-        ax.plot(subset["layer"], subset["num_nonzero"],
-                marker="o", markersize=3, label=MODEL_LABELS[model_key])
+        subset = fixed_c_df[fixed_c_df["model"] == model_key].sort_values("layer")
+        ax1.plot(subset["layer"], subset["num_nonzero"],
+                 marker="o", markersize=3, label=MODEL_LABELS[model_key])
+        ax2.plot(subset["layer"], subset["roc_auc"],
+                 marker="o", markersize=3, label=MODEL_LABELS[model_key])
 
-    ax.set_xlabel("Layer")
-    ax.set_ylabel("Number of Nonzero Dimensions (out of 1536)")
-    ax.set_title("L1 Probe Sparsity by Layer (Last-Chunk Only)")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    ax1.set_xlabel("Layer")
+    ax1.set_ylabel("Number of Nonzero Dimensions (out of 1536)")
+    ax1.set_title(f"L1 Probe Sparsity (C={FIXED_C}, Last-Chunk Only)")
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
 
+    ax2.set_xlabel("Layer")
+    ax2.set_ylabel("ROC-AUC")
+    ax2.set_title(f"Sparse Probe Accuracy (C={FIXED_C}, Last-Chunk Only)")
+    ax2.axhline(y=0.5, color="gray", linestyle="--", linewidth=1, label="Random")
+    ax2.legend(fontsize=9)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
     save_path = os.path.join(figures_dir, "sparsity_by_layer.png")
     fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -374,7 +423,7 @@ def _plot_dimension_overlap(overlap_info: dict, output_dir: str) -> None:
                 str(count), ha="center", va="bottom", fontsize=11)
 
     ax.set_ylabel("Number of Dimensions")
-    ax.set_title(f"Nonzero Dimension Overlap at Layer {overlap_info['best_layer']}\n"
+    ax.set_title(f"Nonzero Dimension Overlap at Layer {overlap_info['best_layer']} (C={overlap_info['C']})\n"
                  f"Jaccard = {overlap_info['jaccard_similarity']:.3f}, "
                  f"Weight r = {overlap_info['weight_correlation_shared_dims']:.3f}")
     ax.grid(True, alpha=0.3, axis="y")
@@ -385,24 +434,32 @@ def _plot_dimension_overlap(overlap_info: dict, output_dir: str) -> None:
     print(f"Saved figure to {save_path}")
 
 
-def _print_summary(results_df: pd.DataFrame, overlap_info: dict) -> None:
+def _print_summary(
+    results_df: pd.DataFrame, fixed_c_df: pd.DataFrame, overlap_info: dict,
+) -> None:
     """Print summary of sparsity analysis."""
     print(f"\n{'='*60}")
     print("Sparsity Analysis Summary")
     print(f"{'='*60}")
 
+    print("\n  Best-C grid search results:")
     for model_key in MODEL_KEYS:
         subset = results_df[results_df["model"] == model_key]
         best = subset.loc[subset["roc_auc"].idxmax()]
-        print(f"\n  {model_key}:")
-        print(f"    Best layer: {int(best['layer'])} "
-              f"(AUC={best['roc_auc']:.4f}, C={best['best_C']})")
-        print(f"    Nonzero dims: {int(best['num_nonzero'])}/1536 "
-              f"({best['sparsity_ratio']:.1%})")
-        avg_nonzero = subset["num_nonzero"].mean()
-        print(f"    Avg nonzero across layers: {avg_nonzero:.0f}")
+        print(f"    {model_key}: best layer {int(best['layer'])} "
+              f"(AUC={best['roc_auc']:.4f}, C={best['best_C']}, "
+              f"{int(best['num_nonzero'])} dims)")
 
-    print(f"\n  Dimension Overlap (layer {overlap_info['best_layer']}):")
+    print(f"\n  Fixed C={FIXED_C} results:")
+    for model_key in MODEL_KEYS:
+        subset = fixed_c_df[fixed_c_df["model"] == model_key]
+        best = subset.loc[subset["roc_auc"].idxmax()]
+        avg_nonzero = subset["num_nonzero"].mean()
+        print(f"    {model_key}: best layer {int(best['layer'])} "
+              f"(AUC={best['roc_auc']:.4f}, {int(best['num_nonzero'])} dims), "
+              f"avg {avg_nonzero:.0f} dims across layers")
+
+    print(f"\n  Dimension Overlap (layer {overlap_info['best_layer']}, C={overlap_info['C']}):")
     print(f"    Base nonzero:      {overlap_info['base_nonzero_count']}")
     print(f"    Distilled nonzero: {overlap_info['distilled_nonzero_count']}")
     print(f"    Shared:            {overlap_info['shared_count']}")
@@ -428,22 +485,26 @@ def sparsity_analysis(
     best_layer = _get_best_layer(probe_results_path)
 
     # Core: L1 grid search across all layers
-    print("\n--- L1 Sparsity Analysis (last-chunk only) ---")
+    print("\n--- L1 Sparsity Analysis (best-C grid search, last-chunk only) ---")
     results_df = _core_sparsity(layer_data, output_dir)
+
+    # Fixed-C sweep for smooth curves
+    print(f"\n--- Fixed C={FIXED_C} Sparsity (last-chunk only) ---")
+    fixed_c_df = _fixed_c_sparsity(layer_data, output_dir)
 
     # Additional analyses at best layer
     print(f"\n--- Sparsity-Accuracy Tradeoff (layer {best_layer}) ---")
     tradeoff_df = _sparsity_tradeoff(layer_data, best_layer, output_dir)
 
-    print(f"\n--- Dimension Overlap (layer {best_layer}) ---")
+    print(f"\n--- Dimension Overlap (layer {best_layer}, C={FIXED_C}) ---")
     overlap_info = _dimension_overlap(layer_data, best_layer, output_dir)
 
     # Figures
-    _plot_sparsity_by_layer(results_df, output_dir)
+    _plot_sparsity_by_layer(fixed_c_df, output_dir)
     _plot_tradeoff(tradeoff_df, output_dir)
     _plot_dimension_overlap(overlap_info, output_dir)
 
-    _print_summary(results_df, overlap_info)
+    _print_summary(results_df, fixed_c_df, overlap_info)
 
 
 def main() -> None:
