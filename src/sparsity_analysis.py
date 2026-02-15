@@ -1,115 +1,478 @@
-"""Train L1-regularized probes and analyze sparsity of correctness representations."""
+"""L1-regularized probe sparsity analysis with dimension overlap and weight correlation."""
 
 import argparse
+import json
 import os
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.stats import pearsonr
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import StandardScaler
 
-from src.utils import load_hidden_states
+from src.utils import load_jsonl
+
+DEFAULT_HIDDEN_STATES_DIR = "data/hidden_states"
+DEFAULT_CHUNKS_PATH = "data/chunks/gsm8k_chunks.jsonl"
+DEFAULT_PROBE_RESULTS_PATH = "results/metrics/probe_results.csv"
+DEFAULT_OUTPUT_DIR = "results"
+
+C_VALUES = [0.001, 0.01, 0.1, 1.0, 10.0]
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+TOP_K = 20
+MODEL_KEYS = ["base", "distilled"]
+MODEL_LABELS = {
+    "base": "Base (Qwen2.5-Math-1.5B)",
+    "distilled": "Distilled (R1-Distill-Qwen-1.5B)",
+}
 
 
-def sparsity_analysis(
-    hidden_states_dir: str,
-    model_short_name: str,
-    output_path: str,
-    C_values: list[float] | None = None,
-    top_k: int = 50,
-    test_size: float = 0.2,
-    random_state: int = 42,
-) -> pd.DataFrame:
-    """Train L1-regularized probes and report sparsity metrics per layer.
-
-    Args:
-        hidden_states_dir: Directory containing npz files.
-        model_short_name: Model short name for file matching.
-        output_path: Path to save results CSV.
-        C_values: Regularization values to try.
-        top_k: Number of top important dimensions to report.
-        test_size: Fraction of data for test set.
-        random_state: Random seed.
+def _load_aligned_data(
+    hidden_states_dir: str, problems: list[dict],
+) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    """Load aligned hidden states for both base and distilled models.
 
     Returns:
-        DataFrame with sparsity results per layer.
+        Dict mapping layer_idx to (X_base, X_dist, labels, is_last, problem_ids).
     """
-    if C_values is None:
-        C_values = [0.01, 0.1, 1.0, 10.0]
+    base_dir = os.path.join(hidden_states_dir, "base")
+    dist_dir = os.path.join(hidden_states_dir, "distilled")
 
-    print(f"Loading hidden states for {model_short_name}...")
-    layer_data = load_hidden_states(hidden_states_dir, model_short_name)
+    layer_base: dict[int, list[np.ndarray]] = {}
+    layer_dist: dict[int, list[np.ndarray]] = {}
+    layer_labels: dict[int, list[int]] = {}
+    layer_is_last: dict[int, list[bool]] = {}
+    layer_pids: dict[int, list[int]] = {}
 
-    results = []
+    skipped = 0
+    for problem in problems:
+        pid = problem["problem_id"]
+        base_path = os.path.join(base_dir, f"problem_{pid}.npz")
+        dist_path = os.path.join(dist_dir, f"problem_{pid}.npz")
 
-    for layer_idx, (X, y) in sorted(layer_data.items()):
-        if len(np.unique(y)) < 2:
+        if not os.path.exists(base_path) or not os.path.exists(dist_path):
+            skipped += 1
             continue
 
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=random_state, stratify=y
+        base_data = np.load(base_path)
+        dist_data = np.load(dist_path)
+
+        base_labels = base_data["labels"]
+        dist_labels = dist_data["labels"]
+        assert len(base_labels) == len(dist_labels), (
+            f"Problem {pid}: chunk count mismatch "
+            f"(base={len(base_labels)}, distilled={len(dist_labels)})"
         )
+        num_chunks = len(base_labels)
 
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
+        for key in base_data.files:
+            if key == "labels":
+                continue
+            layer_idx = int(key.replace("layer_", ""))
+            if layer_idx not in layer_base:
+                layer_base[layer_idx] = []
+                layer_dist[layer_idx] = []
+                layer_labels[layer_idx] = []
+                layer_is_last[layer_idx] = []
+                layer_pids[layer_idx] = []
 
-        for C in C_values:
-            probe = LogisticRegression(
-                penalty="l1",
-                solver="saga",
-                C=C,
-                max_iter=2000,
-                random_state=random_state,
-            )
-            probe.fit(X_train_scaled, y_train)
+            base_vecs = base_data[key]
+            dist_vecs = dist_data[key]
+            for i in range(num_chunks):
+                layer_base[layer_idx].append(base_vecs[i])
+                layer_dist[layer_idx].append(dist_vecs[i])
+                layer_labels[layer_idx].append(int(base_labels[i]))
+                layer_is_last[layer_idx].append(i == num_chunks - 1)
+                layer_pids[layer_idx].append(pid)
 
-            coefs = probe.coef_[0]
-            n_nonzero = int(np.count_nonzero(coefs))
-            n_total = len(coefs)
-            sparsity_ratio = 1.0 - (n_nonzero / n_total)
+    if skipped:
+        print(f"  Skipped {skipped} problems (missing one or both npz files)")
 
-            # Top-k most important dimensions by absolute coefficient
-            top_indices = np.argsort(np.abs(coefs))[-top_k:][::-1]
-            top_dims = top_indices.tolist()
+    result = {}
+    for layer_idx in sorted(layer_base.keys()):
+        result[layer_idx] = (
+            np.array(layer_base[layer_idx]),
+            np.array(layer_dist[layer_idx]),
+            np.array(layer_labels[layer_idx]),
+            np.array(layer_is_last[layer_idx]),
+            np.array(layer_pids[layer_idx]),
+        )
+    return result
 
-            accuracy = probe.score(X_test_scaled, y_test)
 
-            results.append({
-                "model": model_short_name,
-                "layer": layer_idx,
-                "C": C,
-                "n_nonzero": n_nonzero,
-                "n_total": n_total,
-                "sparsity_ratio": sparsity_ratio,
-                "test_accuracy": accuracy,
-                "top_k_dims": str(top_dims),
-            })
+def _get_best_layer(probe_results_path: str) -> int:
+    """Find the best layer by average ROC-AUC across models (last_chunk_only, linear)."""
+    df = pd.read_csv(probe_results_path)
+    subset = df[
+        (df["analysis_type"] == "last_chunk_only")
+        & (df["probe_type"] == "linear")
+    ]
+    avg_auc = subset.groupby("layer")["roc_auc"].mean()
+    best_layer = int(avg_auc.idxmax())
+    print(f"  Best layer (avg last-chunk-only linear AUC): {best_layer} "
+          f"(AUC={avg_auc[best_layer]:.4f})")
+    return best_layer
 
-        print(f"  Layer {layer_idx}: best nonzero = "
-              f"{min(r['n_nonzero'] for r in results[-len(C_values):])} / {n_total}")
+
+def _train_l1_probe(X_train, y_train, X_test, y_test, C):
+    """Train an L1 probe at a given C and return (roc_auc, num_nonzero, coefs)."""
+    scaler = StandardScaler()
+    X_tr = scaler.fit_transform(X_train)
+    X_te = scaler.transform(X_test)
+
+    probe = LogisticRegression(
+        solver="saga", C=C, l1_ratio=1, class_weight="balanced",
+        max_iter=5000, random_state=RANDOM_STATE,
+    )
+    probe.fit(X_tr, y_train)
+
+    probs = probe.predict_proba(X_te)[:, 1]
+    auc = roc_auc_score(y_test, probs)
+    coefs = probe.coef_[0]
+    num_nonzero = int(np.count_nonzero(coefs))
+
+    return auc, num_nonzero, coefs
+
+
+def _core_sparsity(layer_data: dict, output_dir: str) -> pd.DataFrame:
+    """Run L1 grid search for both models across all layers (last-chunk only)."""
+    metrics_dir = os.path.join(output_dir, "metrics")
+    os.makedirs(metrics_dir, exist_ok=True)
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    results = []
+
+    for layer_idx in sorted(layer_data.keys()):
+        X_base, X_dist, labels, is_last, pids = layer_data[layer_idx]
+
+        # Filter to last chunks
+        mask = is_last
+        y = labels[mask]
+        g = pids[mask]
+
+        if len(np.unique(y)) < 2:
+            print(f"  Layer {layer_idx}: skipping (single class)")
+            continue
+
+        train_idx, test_idx = next(gss.split(y, y, groups=g))
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        for model_key, X_all in [("base", X_base), ("distilled", X_dist)]:
+            X = X_all[mask]
+            X_train, X_test = X[train_idx], X[test_idx]
+
+            best_auc = -1
+            best_row = None
+            for C in C_VALUES:
+                auc, num_nonzero, coefs = _train_l1_probe(
+                    X_train, y_train, X_test, y_test, C,
+                )
+                if auc > best_auc:
+                    best_auc = auc
+                    top_indices = np.argsort(np.abs(coefs))[-TOP_K:][::-1].tolist()
+                    best_row = {
+                        "model": model_key,
+                        "layer": layer_idx,
+                        "best_C": C,
+                        "roc_auc": auc,
+                        "num_nonzero": num_nonzero,
+                        "sparsity_ratio": num_nonzero / len(coefs),
+                        "top_20_dims": str(top_indices),
+                    }
+
+            results.append(best_row)
+
+        print(f"  Layer {layer_idx:2d}: "
+              f"base={results[-2]['num_nonzero']:4d} dims (AUC={results[-2]['roc_auc']:.4f})  "
+              f"dist={results[-1]['num_nonzero']:4d} dims (AUC={results[-1]['roc_auc']:.4f})")
 
     df = pd.DataFrame(results)
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    df.to_csv(output_path, index=False)
-    print(f"\nSaved sparsity results to {output_path}")
+    csv_path = os.path.join(metrics_dir, "sparsity_results.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Saved sparsity results to {csv_path}")
     return df
 
 
+def _sparsity_tradeoff(
+    layer_data: dict, best_layer: int, output_dir: str,
+) -> pd.DataFrame:
+    """Sweep C values at the best layer with a single fixed split."""
+    metrics_dir = os.path.join(output_dir, "metrics")
+
+    X_base, X_dist, labels, is_last, pids = layer_data[best_layer]
+    mask = is_last
+    y = labels[mask]
+    g = pids[mask]
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    train_idx, test_idx = next(gss.split(y, y, groups=g))
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    rows = []
+    for model_key, X_all in [("base", X_base), ("distilled", X_dist)]:
+        X = X_all[mask]
+        X_train, X_test = X[train_idx], X[test_idx]
+
+        for C in C_VALUES:
+            auc, num_nonzero, _ = _train_l1_probe(X_train, y_train, X_test, y_test, C)
+            rows.append({
+                "model": model_key,
+                "layer": best_layer,
+                "C": C,
+                "roc_auc": auc,
+                "num_nonzero": num_nonzero,
+            })
+
+    df = pd.DataFrame(rows)
+    csv_path = os.path.join(metrics_dir, "sparsity_tradeoff.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Saved sparsity tradeoff to {csv_path}")
+    return df
+
+
+def _dimension_overlap(
+    layer_data: dict, best_layer: int, output_dir: str,
+) -> dict:
+    """Compute dimension overlap and weight correlation at the best layer."""
+    metrics_dir = os.path.join(output_dir, "metrics")
+
+    X_base, X_dist, labels, is_last, pids = layer_data[best_layer]
+    mask = is_last
+    y = labels[mask]
+    g = pids[mask]
+
+    gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE)
+    train_idx, test_idx = next(gss.split(y, y, groups=g))
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    # Train at best C for each model (find best C first)
+    model_coefs = {}
+    model_best_c = {}
+    for model_key, X_all in [("base", X_base), ("distilled", X_dist)]:
+        X = X_all[mask]
+        X_train, X_test = X[train_idx], X[test_idx]
+
+        best_auc = -1
+        best_coefs = None
+        best_c = None
+        for C in C_VALUES:
+            auc, _, coefs = _train_l1_probe(X_train, y_train, X_test, y_test, C)
+            if auc > best_auc:
+                best_auc = auc
+                best_coefs = coefs
+                best_c = C
+
+        model_coefs[model_key] = best_coefs
+        model_best_c[model_key] = best_c
+
+    base_nonzero = set(np.nonzero(model_coefs["base"])[0].tolist())
+    dist_nonzero = set(np.nonzero(model_coefs["distilled"])[0].tolist())
+
+    shared = base_nonzero & dist_nonzero
+    union = base_nonzero | dist_nonzero
+    jaccard = len(shared) / len(union) if union else 0.0
+
+    # Weight correlation on shared dimensions
+    weight_corr = float("nan")
+    if len(shared) >= 2:
+        shared_idx = sorted(shared)
+        w_base = model_coefs["base"][shared_idx]
+        w_dist = model_coefs["distilled"][shared_idx]
+        weight_corr, _ = pearsonr(w_base, w_dist)
+        weight_corr = float(weight_corr)
+
+    overlap_info = {
+        "best_layer": best_layer,
+        "base_best_C": model_best_c["base"],
+        "distilled_best_C": model_best_c["distilled"],
+        "base_nonzero_count": len(base_nonzero),
+        "distilled_nonzero_count": len(dist_nonzero),
+        "shared_count": len(shared),
+        "base_only_count": len(base_nonzero - dist_nonzero),
+        "distilled_only_count": len(dist_nonzero - base_nonzero),
+        "jaccard_similarity": jaccard,
+        "weight_correlation_shared_dims": weight_corr,
+    }
+
+    json_path = os.path.join(metrics_dir, "dimension_overlap.json")
+    with open(json_path, "w") as f:
+        json.dump(overlap_info, f, indent=2)
+    print(f"Saved dimension overlap to {json_path}")
+    return overlap_info
+
+
+def _plot_sparsity_by_layer(results_df: pd.DataFrame, output_dir: str) -> None:
+    """Plot nonzero dimensions vs layer for both models."""
+    figures_dir = os.path.join(output_dir, "figures")
+    os.makedirs(figures_dir, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for model_key in MODEL_KEYS:
+        subset = results_df[results_df["model"] == model_key].sort_values("layer")
+        ax.plot(subset["layer"], subset["num_nonzero"],
+                marker="o", markersize=3, label=MODEL_LABELS[model_key])
+
+    ax.set_xlabel("Layer")
+    ax.set_ylabel("Number of Nonzero Dimensions (out of 1536)")
+    ax.set_title("L1 Probe Sparsity by Layer (Last-Chunk Only)")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    save_path = os.path.join(figures_dir, "sparsity_by_layer.png")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved figure to {save_path}")
+
+
+def _plot_tradeoff(tradeoff_df: pd.DataFrame, output_dir: str) -> None:
+    """Plot sparsity-accuracy tradeoff at the best layer."""
+    figures_dir = os.path.join(output_dir, "figures")
+    os.makedirs(figures_dir, exist_ok=True)
+
+    best_layer = tradeoff_df["layer"].iloc[0]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for model_key in MODEL_KEYS:
+        subset = tradeoff_df[tradeoff_df["model"] == model_key].sort_values("num_nonzero")
+        ax.plot(subset["num_nonzero"], subset["roc_auc"],
+                marker="o", markersize=5, label=MODEL_LABELS[model_key])
+
+    ax.set_xlabel("Number of Nonzero Dimensions")
+    ax.set_ylabel("ROC-AUC")
+    ax.set_title(f"Sparsity-Accuracy Tradeoff (Layer {best_layer}, Last-Chunk Only)")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    save_path = os.path.join(figures_dir, "sparsity_accuracy_tradeoff.png")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved figure to {save_path}")
+
+
+def _plot_dimension_overlap(overlap_info: dict, output_dir: str) -> None:
+    """Bar chart showing base-only, shared, distilled-only dimension counts."""
+    figures_dir = os.path.join(output_dir, "figures")
+    os.makedirs(figures_dir, exist_ok=True)
+
+    categories = ["Base only", "Shared", "Distilled only"]
+    counts = [
+        overlap_info["base_only_count"],
+        overlap_info["shared_count"],
+        overlap_info["distilled_only_count"],
+    ]
+    colors = ["#1f77b4", "#2ca02c", "#ff7f0e"]
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bars = ax.bar(categories, counts, color=colors, edgecolor="black", linewidth=0.5)
+    for bar, count in zip(bars, counts):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                str(count), ha="center", va="bottom", fontsize=11)
+
+    ax.set_ylabel("Number of Dimensions")
+    ax.set_title(f"Nonzero Dimension Overlap at Layer {overlap_info['best_layer']}\n"
+                 f"Jaccard = {overlap_info['jaccard_similarity']:.3f}, "
+                 f"Weight r = {overlap_info['weight_correlation_shared_dims']:.3f}")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    save_path = os.path.join(figures_dir, "dimension_overlap_venn.png")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved figure to {save_path}")
+
+
+def _print_summary(results_df: pd.DataFrame, overlap_info: dict) -> None:
+    """Print summary of sparsity analysis."""
+    print(f"\n{'='*60}")
+    print("Sparsity Analysis Summary")
+    print(f"{'='*60}")
+
+    for model_key in MODEL_KEYS:
+        subset = results_df[results_df["model"] == model_key]
+        best = subset.loc[subset["roc_auc"].idxmax()]
+        print(f"\n  {model_key}:")
+        print(f"    Best layer: {int(best['layer'])} "
+              f"(AUC={best['roc_auc']:.4f}, C={best['best_C']})")
+        print(f"    Nonzero dims: {int(best['num_nonzero'])}/1536 "
+              f"({best['sparsity_ratio']:.1%})")
+        avg_nonzero = subset["num_nonzero"].mean()
+        print(f"    Avg nonzero across layers: {avg_nonzero:.0f}")
+
+    print(f"\n  Dimension Overlap (layer {overlap_info['best_layer']}):")
+    print(f"    Base nonzero:      {overlap_info['base_nonzero_count']}")
+    print(f"    Distilled nonzero: {overlap_info['distilled_nonzero_count']}")
+    print(f"    Shared:            {overlap_info['shared_count']}")
+    print(f"    Jaccard similarity: {overlap_info['jaccard_similarity']:.3f}")
+    print(f"    Weight correlation (shared dims): {overlap_info['weight_correlation_shared_dims']:.3f}")
+
+
+def sparsity_analysis(
+    hidden_states_dir: str, chunks_path: str,
+    probe_results_path: str, output_dir: str,
+) -> None:
+    """Run full L1 sparsity analysis."""
+    print(f"Loading chunks from {chunks_path}...")
+    problems = load_jsonl(chunks_path)
+    print(f"Loaded {len(problems)} problems")
+
+    print("\nLoading aligned hidden states...")
+    layer_data = _load_aligned_data(hidden_states_dir, problems)
+    print(f"Loaded {len(layer_data)} layers")
+
+    # Find best layer from Day 6 probe results
+    print("\nSelecting best layer from probe results...")
+    best_layer = _get_best_layer(probe_results_path)
+
+    # Core: L1 grid search across all layers
+    print("\n--- L1 Sparsity Analysis (last-chunk only) ---")
+    results_df = _core_sparsity(layer_data, output_dir)
+
+    # Additional analyses at best layer
+    print(f"\n--- Sparsity-Accuracy Tradeoff (layer {best_layer}) ---")
+    tradeoff_df = _sparsity_tradeoff(layer_data, best_layer, output_dir)
+
+    print(f"\n--- Dimension Overlap (layer {best_layer}) ---")
+    overlap_info = _dimension_overlap(layer_data, best_layer, output_dir)
+
+    # Figures
+    _plot_sparsity_by_layer(results_df, output_dir)
+    _plot_tradeoff(tradeoff_df, output_dir)
+    _plot_dimension_overlap(overlap_info, output_dir)
+
+    _print_summary(results_df, overlap_info)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="L1 sparsity analysis of probes")
-    parser.add_argument("--hidden_states_dir", type=str, required=True)
-    parser.add_argument("--model_short_name", type=str, required=True)
-    parser.add_argument("--output_path", type=str, required=True)
-    parser.add_argument("--top_k", type=int, default=50)
+    parser = argparse.ArgumentParser(
+        description="L1 sparsity analysis with dimension overlap",
+    )
+    parser.add_argument(
+        "--hidden_states_dir", type=str, default=DEFAULT_HIDDEN_STATES_DIR,
+        help=f"Root dir with base/ and distilled/ subdirs (default: {DEFAULT_HIDDEN_STATES_DIR})",
+    )
+    parser.add_argument(
+        "--chunks_path", type=str, default=DEFAULT_CHUNKS_PATH,
+        help=f"Path to chunks JSONL (default: {DEFAULT_CHUNKS_PATH})",
+    )
+    parser.add_argument(
+        "--probe_results_path", type=str, default=DEFAULT_PROBE_RESULTS_PATH,
+        help=f"Path to probe results CSV (default: {DEFAULT_PROBE_RESULTS_PATH})",
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default=DEFAULT_OUTPUT_DIR,
+        help=f"Output dir for metrics/ and figures/ (default: {DEFAULT_OUTPUT_DIR})",
+    )
     args = parser.parse_args()
 
     sparsity_analysis(
         hidden_states_dir=args.hidden_states_dir,
-        model_short_name=args.model_short_name,
-        output_path=args.output_path,
-        top_k=args.top_k,
+        chunks_path=args.chunks_path,
+        probe_results_path=args.probe_results_path,
+        output_dir=args.output_dir,
     )
 
 

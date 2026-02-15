@@ -1,0 +1,12 @@
+{
+  "best_layer": 25,
+  "base_best_C": 10.0,
+  "distilled_best_C": 10.0,
+  "base_nonzero_count": 947,
+  "distilled_nonzero_count": 1157,
+  "shared_count": 737,
+  "base_only_count": 210,
+  "distilled_only_count": 420,
+  "jaccard_similarity": 0.5391367959034382,
+  "weight_correlation_shared_dims": 0.2932471036911011
+}
