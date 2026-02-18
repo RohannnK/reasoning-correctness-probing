@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from itertools import combinations
 
 import matplotlib
 matplotlib.use("Agg")
@@ -434,6 +435,95 @@ def _plot_dimension_overlap(overlap_info: dict, output_dir: str) -> None:
     print(f"Saved figure to {save_path}")
 
 
+def _l1_stability_check(
+    layer_data: dict, best_layer: int, overlap_info: dict, output_dir: str,
+) -> None:
+    """Test L1 feature selection stability via within-model Jaccard across splits."""
+    metrics_dir = os.path.join(output_dir, "metrics")
+    n_splits = 10
+
+    X_base, X_dist, labels, is_last, pids = layer_data[best_layer]
+    mask = is_last
+    y = labels[mask]
+    g = pids[mask]
+
+    stability_results = {}
+    for model_key, X_all in [("base", X_base), ("distilled", X_dist)]:
+        X = X_all[mask]
+
+        # Train on 10 different splits, collect nonzero sets
+        nonzero_sets = []
+        for seed in range(n_splits):
+            gss = GroupShuffleSplit(n_splits=1, test_size=TEST_SIZE, random_state=seed)
+            train_idx, test_idx = next(gss.split(X, y, groups=g))
+
+            scaler = StandardScaler()
+            X_tr = scaler.fit_transform(X[train_idx])
+
+            probe = LogisticRegression(
+                solver="saga", C=FIXED_C, l1_ratio=1, class_weight="balanced",
+                max_iter=5000, random_state=RANDOM_STATE,
+            )
+            probe.fit(X_tr, y[train_idx])
+            nonzero = set(np.nonzero(probe.coef_[0])[0].tolist())
+            nonzero_sets.append(nonzero)
+
+        # Pairwise Jaccard for all 45 pairs
+        pairwise = []
+        for i, j in combinations(range(n_splits), 2):
+            union = nonzero_sets[i] | nonzero_sets[j]
+            inter = nonzero_sets[i] & nonzero_sets[j]
+            jac = len(inter) / len(union) if union else 0.0
+            pairwise.append(jac)
+
+        stability_results[model_key] = {
+            "pairwise_jaccards": pairwise,
+            "mean": float(np.mean(pairwise)),
+            "std": float(np.std(pairwise)),
+            "min": float(np.min(pairwise)),
+            "max": float(np.max(pairwise)),
+            "n_splits": n_splits,
+            "avg_nonzero_per_split": float(np.mean([len(s) for s in nonzero_sets])),
+        }
+
+    cross_model_jaccard = overlap_info["jaccard_similarity"]
+    output = {
+        "layer": best_layer,
+        "C": FIXED_C,
+        "cross_model_jaccard": cross_model_jaccard,
+        "within_model": stability_results,
+    }
+
+    json_path = os.path.join(metrics_dir, "l1_stability_check.json")
+    with open(json_path, "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"Saved L1 stability check to {json_path}")
+
+    # Print summary table
+    print(f"\n  L1 Stability Check (layer {best_layer}, C={FIXED_C}):")
+    print(f"  {'Model':<12} {'Mean Jaccard':>13} {'Std':>7} {'Min':>7} {'Max':>7} {'Avg dims':>9}")
+    print(f"  {'-'*12} {'-'*13} {'-'*7} {'-'*7} {'-'*7} {'-'*9}")
+    for model_key in MODEL_KEYS:
+        s = stability_results[model_key]
+        print(f"  {model_key:<12} {s['mean']:13.3f} {s['std']:7.3f} "
+              f"{s['min']:7.3f} {s['max']:7.3f} {s['avg_nonzero_per_split']:9.1f}")
+    print(f"  {'cross-model':<12} {cross_model_jaccard:13.3f}")
+    print()
+
+    # Interpretation
+    avg_within = np.mean([stability_results[m]["mean"] for m in MODEL_KEYS])
+    if avg_within < 0.1:
+        print("  Interpretation: Within-model Jaccard is low — L1 feature selection")
+        print("  is unstable. The low cross-model overlap may be an L1 artifact.")
+    elif avg_within > 3 * cross_model_jaccard:
+        print("  Interpretation: Within-model Jaccard is much higher than cross-model.")
+        print("  L1 is stable within each model but selects different features across")
+        print("  models. The cross-model difference is real.")
+    else:
+        print("  Interpretation: Within-model and cross-model Jaccard are comparable.")
+        print("  Cannot distinguish real model differences from L1 instability.")
+
+
 def _print_summary(
     results_df: pd.DataFrame, fixed_c_df: pd.DataFrame, overlap_info: dict,
 ) -> None:
@@ -505,6 +595,10 @@ def sparsity_analysis(
     _plot_dimension_overlap(overlap_info, output_dir)
 
     _print_summary(results_df, fixed_c_df, overlap_info)
+
+    # L1 stability check
+    print(f"\n--- L1 Stability Check (layer {best_layer}, C={FIXED_C}) ---")
+    _l1_stability_check(layer_data, best_layer, overlap_info, output_dir)
 
 
 def main() -> None:
