@@ -1,0 +1,2 @@
+features,n_samples,positive_rate,n_splits,mean_auc,std_auc,ci_lo,ci_hi,probe_base_best_auc,probe_dist_best_auc,position_baseline_auc,delta_base,delta_dist
+"total_chunks,total_char_length,last_chunk_char_position",2500,0.6516,10,0.6104884635061346,0.025843734051727456,0.5598347447647488,0.6611421822475204,0.8578,0.8555,0.8496,0.2473115364938654,0.24501153649386542

@@ -33,6 +33,9 @@ MODEL_LABELS = {
 C_VALUES = [0.01, 0.1, 1.0, 10.0]
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
+N_SPLITS = 10           # splits for last_chunk_only (key analysis); CI from ±1.96·std across splits
+N_SPLITS_ALL_CHUNKS = 1 # single split for all_chunks (large dataset, secondary analysis)
+SKIP_ALL_CHUNKS = True  # skip all_chunks analysis — too slow on 2500 problems (16K samples×1536 dims)
 
 
 def _load_layer_data(
@@ -141,8 +144,8 @@ def _train_linear(X_train, y_train, X_test, y_test):
         LogisticRegression(class_weight="balanced", max_iter=1000, solver="lbfgs"),
         param_grid={"C": C_VALUES},
         scoring="roc_auc",
-        cv=StratifiedShuffleSplit(n_splits=3, test_size=0.2, random_state=RANDOM_STATE),
-        n_jobs=-1,
+        cv=StratifiedShuffleSplit(n_splits=2, test_size=0.2, random_state=RANDOM_STATE),
+        n_jobs=1,
     )
     lr_cv.fit(X_tr, y_train)
     metrics = _eval_probe(lr_cv.best_estimator_, X_te, y_test)
@@ -165,6 +168,20 @@ def _train_mlp(X_train, y_train, X_test, y_test):
     )
     mlp.fit(X_tr, y_train, sample_weight=sample_weights)
     return _eval_probe(mlp, X_te, y_test)
+
+
+def _average_metrics(metrics_list: list[dict]) -> dict:
+    """Average a list of per-split metric dicts; derive CI from std of ROC-AUC across splits."""
+    keys = metrics_list[0].keys()
+    result = {}
+    for k in keys:
+        vals = [m[k] for m in metrics_list if m.get(k) is not None]
+        result[k] = float(np.mean(vals))
+    aucs = [m["roc_auc"] for m in metrics_list]
+    std = float(np.std(aucs, ddof=1)) if len(aucs) > 1 else 0.0
+    result["roc_auc_ci_lo"] = result["roc_auc"] - 1.96 * std
+    result["roc_auc_ci_hi"] = result["roc_auc"] + 1.96 * std
+    return result
 
 
 def train_probes(
@@ -205,7 +222,7 @@ def train_probes(
         print(f"Loaded {len(layer_data)} layers")
 
         gss = GroupShuffleSplit(
-            n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE,
+            n_splits=N_SPLITS_ALL_CHUNKS, test_size=TEST_SIZE, random_state=RANDOM_STATE,
         )
 
         for layer_idx, (X, y, positions, is_last, problem_ids) in sorted(layer_data.items()):
@@ -216,11 +233,11 @@ def train_probes(
                 print(f"  Skipping: only one class present.")
                 continue
 
-            # Problem-level train/test split (used for all_chunks and position baseline)
-            train_idx, test_idx = next(gss.split(X, y, groups=problem_ids))
+            splits = list(gss.split(X, y, groups=problem_ids))
 
-            # ---- Position-only baseline (fit once, duplicate for both models) ----
+            # ---- Position-only baseline (single split, fit once across all layers) ----
             if not position_baseline_done:
+                train_idx, test_idx = splits[0]
                 pos_train = positions[train_idx].reshape(-1, 1)
                 pos_test = positions[test_idx].reshape(-1, 1)
                 yp_train, yp_test = y[train_idx], y[test_idx]
@@ -244,28 +261,42 @@ def train_probes(
                 print(f"  Position-only baseline AUC={pos_metrics['roc_auc']:.4f}")
                 position_baseline_done = True
 
-            # ---- All-chunks probes (position confounded) ----
-            X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
+            # ---- All-chunks probes (skipped when SKIP_ALL_CHUNKS=True) ----
+            if not SKIP_ALL_CHUNKS:
+                all_lr_metrics_list: list[dict] = []
+                all_mlp_metrics_list: list[dict] = []
+                lr_cs: list[float] = []
 
-            lr_metrics, best_c = _train_linear(X_train, y_train, X_test, y_test)
-            results.append({
-                "model_key": model_key, "layer": layer_idx,
-                "probe_type": "linear", "analysis_type": "all_chunks",
-                "best_C": best_c, **lr_metrics,
-            })
+                for train_idx, test_idx in splits:
+                    X_tr, X_te = X[train_idx], X[test_idx]
+                    y_tr, y_te = y[train_idx], y[test_idx]
+                    if len(np.unique(y_te)) < 2:
+                        continue
+                    lr_m, best_c = _train_linear(X_tr, y_tr, X_te, y_te)
+                    all_lr_metrics_list.append(lr_m)
+                    lr_cs.append(best_c)
+                    all_mlp_metrics_list.append(_train_mlp(X_tr, y_tr, X_te, y_te))
 
-            mlp_metrics = _train_mlp(X_train, y_train, X_test, y_test)
-            results.append({
-                "model_key": model_key, "layer": layer_idx,
-                "probe_type": "mlp", "analysis_type": "all_chunks",
-                "best_C": None, **mlp_metrics,
-            })
+                if all_lr_metrics_list:
+                    lr_metrics = _average_metrics(all_lr_metrics_list)
+                    best_c = max(set(lr_cs), key=lr_cs.count)
+                    results.append({
+                        "model_key": model_key, "layer": layer_idx,
+                        "probe_type": "linear", "analysis_type": "all_chunks",
+                        "best_C": best_c, **lr_metrics,
+                    })
+                if all_mlp_metrics_list:
+                    mlp_metrics = _average_metrics(all_mlp_metrics_list)
+                    results.append({
+                        "model_key": model_key, "layer": layer_idx,
+                        "probe_type": "mlp", "analysis_type": "all_chunks",
+                        "best_C": None, **mlp_metrics,
+                    })
+                if all_lr_metrics_list and all_mlp_metrics_list:
+                    print(f"  All-chunks  Linear AUC={lr_metrics['roc_auc']:.4f}  "
+                          f"MLP AUC={mlp_metrics['roc_auc']:.4f}")
 
-            print(f"  All-chunks  Linear AUC={lr_metrics['roc_auc']:.4f}  "
-                  f"MLP AUC={mlp_metrics['roc_auc']:.4f}")
-
-            # ---- Last-chunk-only probes (position controlled) ----
+            # ---- Last-chunk-only probes (N_SPLITS-split average) ----
             mask = is_last
             X_last, y_last = X[mask], y[mask]
             pids_last = problem_ids[mask]
@@ -275,34 +306,40 @@ def train_probes(
                 continue
 
             gss_last = GroupShuffleSplit(
-                n_splits=1, test_size=TEST_SIZE, random_state=RANDOM_STATE,
+                n_splits=N_SPLITS, test_size=TEST_SIZE, random_state=RANDOM_STATE,
             )
-            train_idx_l, test_idx_l = next(
-                gss_last.split(X_last, y_last, groups=pids_last),
-            )
-            X_train_l, X_test_l = X_last[train_idx_l], X_last[test_idx_l]
-            y_train_l, y_test_l = y_last[train_idx_l], y_last[test_idx_l]
+            last_lr_metrics_list: list[dict] = []
+            last_mlp_metrics_list: list[dict] = []
+            last_lr_cs: list[float] = []
 
-            lr_last_metrics, best_c_last = _train_linear(
-                X_train_l, y_train_l, X_test_l, y_test_l,
-            )
-            results.append({
-                "model_key": model_key, "layer": layer_idx,
-                "probe_type": "linear", "analysis_type": "last_chunk_only",
-                "best_C": best_c_last, **lr_last_metrics,
-            })
+            for train_idx_l, test_idx_l in gss_last.split(X_last, y_last, groups=pids_last):
+                X_tr_l, X_te_l = X_last[train_idx_l], X_last[test_idx_l]
+                y_tr_l, y_te_l = y_last[train_idx_l], y_last[test_idx_l]
+                if len(np.unique(y_te_l)) < 2:
+                    continue
+                lr_m, best_c_l = _train_linear(X_tr_l, y_tr_l, X_te_l, y_te_l)
+                last_lr_metrics_list.append(lr_m)
+                last_lr_cs.append(best_c_l)
+                last_mlp_metrics_list.append(_train_mlp(X_tr_l, y_tr_l, X_te_l, y_te_l))
 
-            mlp_last_metrics = _train_mlp(
-                X_train_l, y_train_l, X_test_l, y_test_l,
-            )
-            results.append({
-                "model_key": model_key, "layer": layer_idx,
-                "probe_type": "mlp", "analysis_type": "last_chunk_only",
-                "best_C": None, **mlp_last_metrics,
-            })
-
-            print(f"  Last-chunk  Linear AUC={lr_last_metrics['roc_auc']:.4f}  "
-                  f"MLP AUC={mlp_last_metrics['roc_auc']:.4f}")
+            if last_lr_metrics_list:
+                lr_last_metrics = _average_metrics(last_lr_metrics_list)
+                best_c_last = max(set(last_lr_cs), key=last_lr_cs.count)
+                results.append({
+                    "model_key": model_key, "layer": layer_idx,
+                    "probe_type": "linear", "analysis_type": "last_chunk_only",
+                    "best_C": best_c_last, **lr_last_metrics,
+                })
+            if last_mlp_metrics_list:
+                mlp_last_metrics = _average_metrics(last_mlp_metrics_list)
+                results.append({
+                    "model_key": model_key, "layer": layer_idx,
+                    "probe_type": "mlp", "analysis_type": "last_chunk_only",
+                    "best_C": None, **mlp_last_metrics,
+                })
+            if last_lr_metrics_list and last_mlp_metrics_list:
+                print(f"  Last-chunk  Linear AUC={lr_last_metrics['roc_auc']:.4f}  "
+                      f"MLP AUC={mlp_last_metrics['roc_auc']:.4f}")
 
     df = pd.DataFrame(results)
 

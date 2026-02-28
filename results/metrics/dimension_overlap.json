@@ -1,11 +1,11 @@
 {
-  "best_layer": 25,
+  "best_layer": 17,
   "C": 0.1,
-  "base_nonzero_count": 56,
-  "distilled_nonzero_count": 69,
-  "shared_count": 4,
-  "base_only_count": 52,
-  "distilled_only_count": 65,
-  "jaccard_similarity": 0.03305785123966942,
-  "weight_correlation_shared_dims": 0.9781664609909058
+  "base_nonzero_count": 256,
+  "distilled_nonzero_count": 285,
+  "shared_count": 72,
+  "base_only_count": 184,
+  "distilled_only_count": 213,
+  "jaccard_similarity": 0.1535181236673774,
+  "weight_correlation_shared_dims": 0.6130220293998718
 }
