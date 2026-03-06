@@ -1,4 +1,4 @@
-data/
+data/hidden_states/
 results/probes/
 *.npz
 __pycache__/
@@ -12,3 +12,4 @@ build/
 wandb/
 .venv/
 venv/
+.DS_Store
